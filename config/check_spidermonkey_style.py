@@ -73,6 +73,7 @@ included_inclnames_to_ignore = set([
     "jit/AtomicOperationsGenerated.h",  # generated in $OBJDIR
     "jit/CacheIROpsGenerated.h",  # generated in $OBJDIR
     "jit/CacheIRAOTGenerated.h",  # generated in $OBJDIR
+    "jit/GuardDescriptorArgKindsGenerated.h",  # generated in $OBJDIR
     "jit/LIROpsGenerated.h",  # generated in $OBJDIR
     "jit/MIROpsGenerated.h",  # generated in $OBJDIR
     "js/PrefsGenerated.h",  # generated in $OBJDIR

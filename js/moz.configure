@@ -527,6 +527,14 @@ set_config("JS_JITSPEW", depends_if("--enable-jitspew")(lambda _: True))
 set_define("JS_STRUCTURED_SPEW", depends_if("--enable-jitspew")(lambda _: True))
 set_config("JS_STRUCTURED_SPEW", depends_if("--enable-jitspew")(lambda _: True))
 
+option(
+    "--enable-guard-descriptors",
+    default=False,
+    help="{Enable|Disable} <description>",
+)
+
+set_define("JS_GUARD_DESCRIPTORS", depends_if("--enable-guard-descriptors")(lambda _: True))
+set_config("JS_GUARD_DESCRIPTORS", depends_if("--enable-guard-descriptors")(lambda _: True))
 
 @depends("--enable-jit", "--enable-jitspew", simulator, target, moz_debug)
 def jit_disasm_arm(jit_enabled, spew, simulator, target, debug):

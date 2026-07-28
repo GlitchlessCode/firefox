@@ -44,6 +44,8 @@ UNIFIED_SOURCES += [
     "FoldLinearArithConstants.cpp",
     "FoldTests.cpp",
     "GraphSpewer.cpp",
+    "GuardDescriptor.cpp",
+    "GuardDescriptorCollector.cpp",
     "InlinableNatives.cpp",
     "InstructionReordering.cpp",
     "InterpreterEntryTrampoline.cpp",
@@ -301,6 +303,14 @@ GeneratedFile(
     entry_point="generate_atomics_header",
     inputs=[],
 )
+
+if CONFIG["JS_GUARD_DESCRIPTORS"]:
+    GeneratedFile(
+        "GuardDescriptorArgKindsGenerated.h",
+        script="GenerateGuardDescriptorArgKinds.py",
+        entry_point="generate_guard_descriptor_arg_kinds_header",
+        inputs=["CacheIROps.yaml"],
+    )
 
 if CONFIG["ENABLE_JS_AOT_ICS"]:
     GeneratedFile(

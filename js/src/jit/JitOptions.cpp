@@ -173,6 +173,9 @@ DefaultJitOptions::DefaultJitOptions() {
   // Whether offthread baseline compilation should be batched.
   SET_DEFAULT(baselineBatching, false);
 
+  // Whether guardDescriptors should be enabled.
+  SET_DEFAULT(guardDescriptors, false);
+
   // Whether Warp should use ICs instead of transpiling Baseline CacheIR.
   SET_DEFAULT(forceInlineCaches, false);
 
