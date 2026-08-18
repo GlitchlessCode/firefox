@@ -11,6 +11,7 @@
 #include "jit/CacheIRAOT.h"
 #include "jit/CacheIRSpewer.h"
 #include "jit/CacheIRWriter.h"
+#include "jit/GuardDescriptor.h"
 #include "jit/JitFrames.h"
 #include "jit/JitRuntime.h"
 #include "jit/JitZone.h"
@@ -2319,6 +2320,10 @@ ICAttachResult js::jit::AttachBaselineCacheIRStubLocked(
 #endif
 
   stub->addNewStub(icEntry, newStub);
+
+#ifdef JS_GUARD_DESCRIPTORS
+  GuardDescriptorCollector::singleton().collectStubStats(newStub);
+#endif
 
   JSScript* owningScript = icScript->isInlined()
                                ? icScript->inliningRoot()->owningScript()

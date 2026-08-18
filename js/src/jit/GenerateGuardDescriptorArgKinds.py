@@ -5,6 +5,7 @@
 # This script generates jit/GuardDescriptorArgKinds.h from CacheIROps.yaml
 
 import io
+from enum import Enum
 
 import buildconfig
 import yaml
@@ -38,14 +39,156 @@ def load_yaml(yaml_path):
     return yaml.safe_load(contents)
 
 
+guard_descriptor_trivial_arg_kinds = {
+    "ValId",
+    "ObjId",
+    "StringId",
+    "SymbolId",
+    "BooleanId",
+    "Int32Id",
+    "NumberId",
+    "BigIntId",
+    "ValueTagId",
+    "IntPtrId",
+    "RawId",
+    "BoolImm",
+    "ByteImm",
+    "Int32Imm",
+    "UInt32Imm",
+    "JSOpImm",
+    "JSTypeImm",
+    "TypeofEqOperandImm",
+    "ValueTypeImm",
+    "JSWhyMagicImm",
+    "CallFlagsImm",
+    "ScalarTypeImm",
+    "UnaryMathFunctionImm",
+    "WasmValTypeImm",
+    "AllocKindImm",
+    "CompletionKindImm",
+    "RealmFuseIndexImm",
+    "RuntimeFuseIndexImm",
+    "ArrayBufferViewKindImm",
+    "GuardClassKindImm",
+}
+
+guard_descriptor_serializable_arg_kinds = {
+    "StaticStringImm",
+    "RawInt32Field",
+    "RawInt64Field",
+    "DoubleField",
+    "StringField",
+    "AtomField",
+}
+
+guard_descriptor_complex_arg_kinds = {
+    "ObjectField",
+    "WeakObjectField",
+    "SymbolField",
+    "IdField",
+    "ShapeField",
+    "WeakShapeField",
+    "ValueField",
+    "WeakValueField",
+    "JSNativeImm",
+    "JitCodeField",
+    "WeakBaseScriptField",
+    "RawPointerField",
+}
+
+
+class Classification(Enum):
+    Trivial = 0
+    Serializable = 1
+    Complex = 2
+    Unserializable = 3
+
+
+def guard_descriptor_arg_kind_classification(kind):
+    if kind in guard_descriptor_trivial_arg_kinds:
+        return Classification.Trivial
+    if kind in guard_descriptor_serializable_arg_kinds:
+        return Classification.Serializable
+    if kind in guard_descriptor_complex_arg_kinds:
+        return Classification.Complex
+    return Classification.Unserializable
+
+
+def emit_macro(macro_name, lines):
+    """Formats a `#define NAME(_) ...` X-macro from a list of `_(...)` lines."""
+    body = " \\\n".join(f"  {line}" for line in lines)
+    return f"#define {macro_name}(_) \\\n{body}\n"
+
+
 def generate_guard_descriptor_arg_kinds_header(c_out, yaml_path):
     """Generate GuardDescriptorArgKindsGenerated.h from CacheIROps.yaml."""
 
     data = load_yaml(yaml_path)
 
-    contents = """
-#define GUARD_DESCRIPTOR_TEST "Hello, world!"
-    """  # TODO
+    all_arg_kinds = sorted(
+        {
+            kind
+            for op in data
+            if op["args"]
+            for kind in op["args"].values()
+        }
+    )
+
+    arg_kinds_macro = emit_macro(
+        "GUARD_DESCRIPTOR_ARG_KINDS",
+        [f"_({kind})" for kind in all_arg_kinds],
+    )
+
+    classification_kinds_macro = emit_macro(
+        "GUARD_DESCRIPTOR_CLASSIFICATION_KINDS",
+        [
+            f"_({classification.name})" for classification in Classification
+        ]
+    )
+
+    classifications_macro = emit_macro(
+        "GUARD_DESCRIPTOR_ARG_KIND_CLASSIFICATIONS",
+        [
+            f"_({kind}, {guard_descriptor_arg_kind_classification(kind).name})"
+            for kind in all_arg_kinds
+        ],
+    )
+
+    op_arg_kinds_lines = []
+    op_has_unserializable_lines = []
+    for op in data:
+        name = op["name"]
+        args = op["args"]
+        assert args is None or isinstance(args, dict)
+
+        kinds = list(args.values()) if args else []
+        has_unserializable = any(
+            guard_descriptor_arg_kind_classification(kind) == "Unserializable"
+            for kind in kinds
+        )
+
+        op_arg_kinds_lines.append(
+            f"_({', '.join([name] + [str(len(kinds))] + kinds)})")
+        op_has_unserializable_lines.append(
+            f"_({name}, {'true' if has_unserializable else 'false'})"
+        )
+
+    op_arg_kinds_macro = emit_macro(
+        "GUARD_DESCRIPTOR_OP_ARG_KINDS", op_arg_kinds_lines
+    )
+    op_has_unserializable_macro = emit_macro(
+        "GUARD_DESCRIPTOR_OP_HAS_UNSERIALIZABLE_ARGS", op_has_unserializable_lines
+    )
+
+    contents = "\n".join(
+        [
+            arg_kinds_macro,
+            classification_kinds_macro,
+            classifications_macro,
+            op_arg_kinds_macro,
+            op_has_unserializable_macro,
+        ]
+    )
 
     c_out.write(
         HEADER_TEMPLATE

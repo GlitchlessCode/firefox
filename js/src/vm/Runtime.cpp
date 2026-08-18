@@ -16,7 +16,7 @@
 #include "frontend/ParserAtom.h"  // frontend::WellKnownParserAtoms
 #include "gc/GC.h"
 #include "gc/PublicIterators.h"
-#include "jit/GuardDescriptorCollector.h"
+#include "jit/GuardDescriptor.h"
 #include "jit/IonCompileTask.h"
 #include "jit/JitOptions.h"  // js::fuzzingSafe
 #include "jit/JitRuntime.h"
@@ -207,7 +207,8 @@ void JSRuntime::destroyRuntime() {
 
 #ifdef JS_GUARD_DESCRIPTORS
   if (jit::JitOptions.guardDescriptors) {
-    jit::collectGuardsDescriptors(this);
+    // jit::collectGuardsDescriptors(this);
+    jit::GuardDescriptorCollector::singleton().dumpStats();
   }
 #endif
 
