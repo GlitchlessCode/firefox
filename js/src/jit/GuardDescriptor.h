@@ -16,6 +16,7 @@
 // and other breaking changes require that any stale guard
 // descriptors must be discarded. The safest way to fail here is to
 // always discard on version change.
+#include "jit/CacheIR.h"
 #ifdef JS_GUARD_DESCRIPTORS
 
 #  include <cstdint>
@@ -55,6 +56,14 @@ class GuardDescriptorCollector {
   std::map<ArgKind, uint32_t> argCounters;
   uint32_t totalArgCounter;
   uint32_t totalOpCounter;
+
+  uint32_t serializedArgCounter;
+  uint32_t totalSeenArgCounter;
+  uint32_t serializedOpCounter;
+  uint32_t totalSeenOpCounter;
+  uint32_t serializedStubCounter;
+  uint32_t totalSeenStubCounter;
+  std::map<CacheOp, std::map<ArgKind, uint32_t>> failedOpCounters;
 };
 
 }  // namespace jit

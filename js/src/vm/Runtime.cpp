@@ -207,7 +207,6 @@ void JSRuntime::destroyRuntime() {
 
 #ifdef JS_GUARD_DESCRIPTORS
   if (jit::JitOptions.guardDescriptors) {
-    // jit::collectGuardsDescriptors(this);
     jit::GuardDescriptorCollector::singleton().dumpStats();
   }
 #endif
