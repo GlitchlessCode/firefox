@@ -2322,8 +2322,7 @@ ICAttachResult js::jit::AttachBaselineCacheIRStubLocked(
   stub->addNewStub(icEntry, newStub);
 
 #ifdef JS_GUARD_DESCRIPTORS
-  GuardDescriptorCollector::singleton().collectStubStats(newStub);
-  GuardDescriptorCollector::singleton().collectStub(newStub);
+  GuardDescriptorCollector::singleton().collectStub(cx, newStub);
 #endif
 
   JSScript* owningScript = icScript->isInlined()

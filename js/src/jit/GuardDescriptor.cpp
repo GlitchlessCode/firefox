@@ -2,13 +2,8 @@
  * License, v. 2.0. If a copy of the MPL was not distributed with this
  * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
 
-#include "js/RootingAPI.h"
-#include "jsapi.h"
-#include "vm/JSContext.h"
-#include "vm/PlainObject.h"
-#include "vm/PropMap.h"
-#include "vm/PropertyInfo.h"
-#include "vm/Shape.h"
+#include "js/TypeDecls.h"
+#include "vm/GlobalObject.h"
 #ifdef JS_GUARD_DESCRIPTORS
 #  include "jit/GuardDescriptor.h"
 
@@ -33,9 +28,15 @@
 #  include "jit/GuardDescriptorArgKindsGenerated.h"
 #  include "js/Printer.h"
 #  include "js/ScalarType.h"
+#  include "vm/ArrayObject.h"
+#  include "vm/JSContext.h"
 #  include "vm/JSONPrinter.h"
+#  include "vm/PlainObject.h"
+#  include "vm/PropMap.h"
 #  include "vm/RealmFuses.h"
 #  include "vm/RuntimeFuses.h"
+#  include "vm/Shape.h"
+#  include "vm/TaggedProto.h"
 #  include "wasm/WasmTypeDecls.h"
 
 using namespace js;
@@ -137,11 +138,53 @@ enum class WellKnownPrototype : uint8_t {
   Object,
   Function,
   Array,
+  // TODO: Add more well-known prototypes
 };
+
+#  define SUPPORTED_CLASSES(_)          \
+    _(PlainObject, PlainObject::class_) \
+    _(ArrayObject, ArrayObject::class_)
+// TODO: Add more well-known classes
+
+// Represents all valid well-known classes, such as PlainObject.
+// Used for shape serialization.
+//
+// TODO: Guard against version changes
+enum class WellKnownClass : uint8_t {
+#  define CLASS_VAR(var, _) var,
+  SUPPORTED_CLASSES(CLASS_VAR)
+#  undef CLASS_VAR
+};
+
+mozilla::Maybe<WellKnownClass> classToEnum(const JSClass* clazz) {
+  using enum WellKnownClass;
+  // TODO: Consider switching this to a hashmap indexed by the JSClass*
+#  define CLASS_CONVERT(var, cls) \
+    if (clazz == &cls) {          \
+      return mozilla::Some(var);  \
+    }
+  SUPPORTED_CLASSES(CLASS_CONVERT)
+#  undef CLASS_CONVERT
+  return mozilla::Nothing();
+}
+
+const JSClass* enumToClass(WellKnownClass clazz) {
+  using enum WellKnownClass;
+  switch (clazz) {
+#  define ENUM_CONVERT(var, cls) \
+    case var:                    \
+      return &cls;
+    SUPPORTED_CLASSES(ENUM_CONVERT)
+#  undef ENUM_CONVERT
+  }
+}
+
+#  undef SUPPORTED_CLASSES
 
 // A data structure to hold the relevant data for reading CacheIR and
 // parsing its data structures. Used during the serialization process.
 struct CacheIRReadData {
+  JSContext* context;
   ICCacheIRStub* stub;
   const CacheIRStubInfo* info;
   CacheIRReader& reader;
@@ -163,7 +206,7 @@ class GuardDescriptorOpReader;
 // no actual data or instance methods.
 template <typename C>
 concept CacheIRCodec = requires(
-    CacheIRReadData& readData, CacheIRWriteData& writeData,
+    C::Source val, CacheIRReadData& readData, CacheIRWriteData& writeData,
     GuardDescriptorOpWriter& gWriter, GuardDescriptorOpReader& gReader) {
   // The source data type of this codec
   typename C::Source;
@@ -175,7 +218,7 @@ concept CacheIRCodec = requires(
   // SAFETY: This function MUST consume the appropriate quantity
   // of data from the CacheIRReader, as this is a side-effect
   // that is propagated forwards.
-  { C::Serialize(readData, gWriter) } -> std::same_as<bool>;
+  { C::Serialize(val, readData, gWriter) } -> std::same_as<bool>;
 
   // Reads the serialized data from gReader and reconstructs it
   // using writeData, returning Some(data) if it was successfully
@@ -187,6 +230,13 @@ concept CacheIRCodec = requires(
   {
     C::Deserialize(writeData, gReader)
   } -> std::same_as<mozilla::Maybe<typename C::Source>>;
+};
+
+template <typename C>
+concept CacheIRCodecExt = requires(CacheIRReadData& readData) {
+  CacheIRCodec<C>;
+
+  { C::Read(readData) } -> std::same_as<typename C::Source>;
 };
 
 class GuardDescriptorOpWriter {
@@ -202,42 +252,13 @@ class GuardDescriptorOpWriter {
     bytes.push_back(((uint16_t)op) >> 8);
   }
 
-  void writeBytes(uint8_t val[], size_t len) {
-    for (size_t i = 0; i < len; i++) {
-      writeUint8(val[i]);
-    }
-  }
-  void writeUint8(uint8_t val) { bytes.push_back(val); }
-  void writeUint16(uint16_t val) {
-    uint8_t arr[2] = {(uint8_t)val, (uint8_t)(val >> 8)};
-    writeBytes(arr, 2);
-  }
-  void writeUint32(uint32_t val) {
-    uint8_t arr[4] = {(uint8_t)val, (uint8_t)(val >> 8), (uint8_t)(val >> 16),
-                      (uint8_t)(val >> 24)};
-    writeBytes(arr, 4);
-  }
-  void writeUint64(uint64_t val) {
-    uint8_t arr[8] = {(uint8_t)val,         (uint8_t)(val >> 8),
-                      (uint8_t)(val >> 16), (uint8_t)(val >> 24),
-                      (uint8_t)(val >> 32), (uint8_t)(val >> 40),
-                      (uint8_t)(val >> 48), (uint8_t)(val >> 56)};
-    writeBytes(arr, 8);
-  }
-
   template <typename T>
   void writeRaw(T val) {
     static_assert(std::is_trivially_copyable_v<T>);
-    if constexpr (sizeof(T) == 1) {
-      writeUint8(static_cast<uint8_t>(val));
-    } else if constexpr (sizeof(T) == 2) {
-      writeUint16(static_cast<uint16_t>(val));
-    } else if constexpr (sizeof(T) == 4) {
-      writeUint32(static_cast<uint32_t>(val));
-    } else if constexpr (sizeof(T) == 8) {
-      writeUint64(static_cast<uint64_t>(val));
-    } else {
-      static_assert(sizeof(T) == 0, "Unsupported width for writeRaw");
+    static_assert(sizeof(T) != 0, "Unsupported width for writeRaw");
+    uint8_t* source = reinterpret_cast<uint8_t*>(&val);
+    for (size_t i = 0; i < sizeof(T); i++) {
+      bytes.push_back(source[i]);
     }
   }
 
@@ -246,10 +267,19 @@ class GuardDescriptorOpWriter {
   // An op which fails to have an argument written must NEVER be written out.
   template <typename Codec>
   void writeArg(CacheIRReadData& readData)
+    requires CacheIRCodecExt<Codec>
+  {
+    if (!failed_) {
+      failed_ = !Codec::Serialize(Codec::Read(readData), readData, *this);
+    }
+  }
+
+  template <typename Codec>
+  void writeSection(Codec::Source val, CacheIRReadData& readData)
     requires CacheIRCodec<Codec>
   {
     if (!failed_) {
-      failed_ = !Codec::Serialize(readData, *this);
+      failed_ = !Codec::Serialize(val, readData, *this);
     }
   }
 
@@ -301,17 +331,15 @@ class GuardDescriptorOpReader {
   template <typename T>
   mozilla::Maybe<T> readRaw() {
     static_assert(std::is_trivially_copyable_v<T>);
-    if constexpr (sizeof(T) == 1) {
-      return readUint8().map([](uint8_t v) { return static_cast<T>(v); });
-    } else if constexpr (sizeof(T) == 2) {
-      return readUint16().map([](uint16_t v) { return static_cast<T>(v); });
-    } else if constexpr (sizeof(T) == 4) {
-      return readUint32().map([](uint32_t v) { return static_cast<T>(v); });
-    } else if constexpr (sizeof(T) == 8) {
-      return readUint64().map([](uint64_t v) { return static_cast<T>(v); });
-    } else {
-      static_assert(sizeof(T) == 0, "Unsupported width for readRaw");
+    static_assert(sizeof(T) != 0, "Unsupported width for readRaw");
+    if (pos_ + sizeof(T) > bytes.Length()) {
+      return mozilla::Nothing();
     }
+
+    T val;
+    std::memcpy(&val, bytes.data() + pos_, sizeof(T));
+    pos_ += sizeof(T);
+    return mozilla::Some(val);
   }
 
   template <typename Codec>
@@ -344,9 +372,14 @@ class GuardDescriptorStubWriter {
 #  define IMM_CODEC(ty, name, readerMethod)                               \
     struct name##Codec {                                                  \
       using Source = ty;                                                  \
-      static bool Serialize(CacheIRReadData& readData,                    \
+                                                                          \
+      static Source Read(CacheIRReadData& readData) {                     \
+        return readData.reader.readerMethod();                            \
+      }                                                                   \
+                                                                          \
+      static bool Serialize(Source val, CacheIRReadData& readData,        \
                             GuardDescriptorOpWriter& writer) {            \
-        writer.writeRaw(readData.reader.readerMethod());                  \
+        writer.writeRaw(val);                                             \
         return true;                                                      \
       }                                                                   \
                                                                           \
@@ -377,9 +410,14 @@ IMM_CODEC(GuardClassKind, GuardClassKindImm, guardClassKind)
 #  define ID_CODEC(ty, name, readerMethod)                                \
     struct name##Codec {                                                  \
       using Source = ty;                                                  \
-      static bool Serialize(CacheIRReadData& readData,                    \
+                                                                          \
+      static Source Read(CacheIRReadData& readData) {                     \
+        return readData.reader.readerMethod();                            \
+      }                                                                   \
+                                                                          \
+      static bool Serialize(Source val, CacheIRReadData& readData,        \
                             GuardDescriptorOpWriter& writer) {            \
-        writer.writeRaw(readData.reader.readerMethod().id());             \
+        writer.writeRaw(val.id());                                        \
         return true;                                                      \
       }                                                                   \
                                                                           \
@@ -404,14 +442,29 @@ ID_CODEC(ValueTagOperandId, ValueTagId, valueTagOperandId)
 
 struct WeakShapeFieldCodec {
   using Source = Shape*;
-  static bool Serialize(CacheIRReadData& readData,
-                        GuardDescriptorOpWriter& writer) {
+
+  struct SerializedShape {};
+
+  struct SerializedPropMap {};
+
+  static Source Read(CacheIRReadData& readData) {
     uint32_t stubOffset = readData.reader.stubOffset();
     auto weakShape = readData.info->getStubField<StubField::Type::WeakShape>(
         readData.stub, stubOffset);
     // TODO: Determine if weak shape can disappear before we use it
     Shape* shape = weakShape.get();
-    // shape->kind();
+    return shape;
+  }
+
+  static bool Serialize(Source val, CacheIRReadData& readData,
+                        GuardDescriptorOpWriter& writer) {
+    // TODO: Handle cases that are not SharedShape, this is a prototype
+    if (!val->isShared()) {
+      return false;
+    }
+    SharedShape& shared = val->asShared();
+    SharedPropMap* propMap = shared.propMap();
+    TaggedProto proto = shared.proto();
     // writer.writeRaw(read.readerMethod().id());
     return true;
   }
@@ -425,6 +478,8 @@ struct WeakShapeFieldCodec {
     SharedPropMap::addProperty(writeData.context, &a, &map, 0, 0,
                                PropertyFlags::defaultDataPropFlags, &b, &slot);
 
+    // JSProtoKey::JSProto_DataView
+
     // return reader.readRaw<uint16_t>().map([](uint16_t id) { return
     // ty(id);
     // });
@@ -436,37 +491,21 @@ struct WeakShapeFieldCodec {
   }
 };
 
+struct SharedPropMapCodec {
+  using Source = SharedPropMap*;
+
+  static bool Serialize(Source val, CacheIRReadData& readData,
+                        GuardDescriptorOpWriter& writer) {}
+  static mozilla::Maybe<Source> Deserialize(CacheIRWriteData& writeData,
+                                            GuardDescriptorOpReader& reader) {}
+};
+
 /*
 CallFlagsImm       - Requires adding a friend clause to read helper
 values RawId              - Requires a return value of OperandId, as
 per CacheIRWriter StaticStringImm    - Must cast pointer to char* and
 read out string TypeofEqOperandImm
 */
-
-GuardDescriptorCollector GuardDescriptorCollector::guardDescriptorCollector =
-    GuardDescriptorCollector();
-
-void GuardDescriptorCollector::collectStubStats(ICCacheIRStub* stub) {
-  const CacheIRStubInfo* info = stub->stubInfo();
-  CacheIRReader reader(info);
-  do {
-    CacheOp op = reader.readOp();
-    ArgsList args = ArgsListOf(op);
-
-    totalArgCounter += args.len;
-    totalOpCounter++;
-    ArgClassification opClassification = ArgClassification::Trivial;
-    for (size_t i = 0; i < args.len; i++) {
-      ArgClassification classification = ArgClassificationOf(args.kinds[i]);
-      argCounters[args.kinds[i]]++;
-      classificationCounters[classification]++;
-      if (classification > opClassification) opClassification = classification;
-    }
-    if (args.len > 0) opMaxClassificationCounters[opClassification]++;
-    uint32_t argLength = CacheIROpInfos[size_t(op)].argLength;
-    reader.skip(argLength);
-  } while (reader.more());
-}
 
 #  define ARGS_WITH_CODEC(_)                                        \
     _(ArgKind::BoolImm, BoolImmCodec)                               \
@@ -495,21 +534,58 @@ void GuardDescriptorCollector::collectStubStats(ICCacheIRStub* stub) {
     _(ArgKind::ValId, ValIdCodec)                                   \
     _(ArgKind::ValueTagId, ValueTagIdCodec)
 
-void GuardDescriptorCollector::collectStub(ICCacheIRStub* stub) {
+GuardDescriptorCollector GuardDescriptorCollector::guardDescriptorCollector =
+    GuardDescriptorCollector();
+
+void GuardDescriptorCollector::collectStubStats(ICCacheIRStub* stub) {
+  totalStubCounter++;
   const CacheIRStubInfo* info = stub->stubInfo();
-  totalSeenStubCounter++;
   CacheIRReader reader(info);
-  CacheIRReadData readData = {stub, info, reader};
+  do {
+    CacheOp op = reader.readOp();
+    ArgsList args = ArgsListOf(op);
+
+    totalArgCounter += args.len;
+    totalOpCounter++;
+    ArgClassification opClassification = ArgClassification::Trivial;
+    for (size_t i = 0; i < args.len; i++) {
+      ArgClassification classification = ArgClassificationOf(args.kinds[i]);
+      argCounters[args.kinds[i]]++;
+      classificationCounters[classification]++;
+      if (classification > opClassification) opClassification = classification;
+
+      switch (args.kinds[i]) {
+#  define DO_NOTHING(kind, codec) \
+    case kind:                    \
+      break;
+        ARGS_WITH_CODEC(DO_NOTHING);
+#  undef DO_NOTHING
+        default: {
+          missingCodecCounter++;
+          missingCodecOps[op].insert(args.kinds[i]);
+        }
+      }
+    }
+    if (args.len > 0) opMaxClassificationCounters[opClassification]++;
+    uint32_t argLength = CacheIROpInfos[size_t(op)].argLength;
+    reader.skip(argLength);
+  } while (reader.more());
+}
+
+void GuardDescriptorCollector::collectStub(JSContext* cx, ICCacheIRStub* stub) {
+  collectStubStats(stub);
+
+  const CacheIRStubInfo* info = stub->stubInfo();
+  CacheIRReader reader(info);
+  CacheIRReadData readData = {cx, stub, info, reader};
   GuardDescriptorStubWriter stubWriter;
 
   do {
     CacheOp op = reader.readOp();
-    totalSeenOpCounter++;
     ArgsList args = ArgsListOf(op);
     GuardDescriptorOpWriter writer(op);
 
     for (size_t i = 0; i < args.len; i++) {
-      totalSeenArgCounter++;
       switch (args.kinds[i]) {
 #  define CASE(kind, codec)             \
     case kind: {                        \
@@ -518,25 +594,22 @@ void GuardDescriptorCollector::collectStub(ICCacheIRStub* stub) {
     }
         ARGS_WITH_CODEC(CASE)
 #  undef CASE
-        default: {
-          failedOpCounters[op][args.kinds[i]]++;
+        default:
           return;
-        }
       }
       if (writer.failed()) {
-        failedOpCounters[op][args.kinds[i]]++;
+        failedCodecCounter++;
         return;
       }
-
-      serializedArgCounter++;
+      successfulCodecCounter++;
     }
 
-    serializedOpCounter++;
     stubWriter.writeOp(writer);
+    completeOpCounter++;
 
   } while (reader.more());
 
-  serializedStubCounter++;
+  completeStubCounter++;
 }
 
 #  undef ARGS_WITH_CODEC
@@ -571,11 +644,6 @@ void GuardDescriptorCollector::dumpStats(GenericPrinter& printer) {
   }
   jsonPrinter.endObject();
 
-  jsonPrinter.beginObjectProperty("totalCount");
-  jsonPrinter.property("op", totalOpCounter);
-  jsonPrinter.property("arg", totalArgCounter);
-  jsonPrinter.endObject();
-
   jsonPrinter.beginObjectProperty("argClass");
   for (auto& classPair : classes) {
     jsonPrinter.beginListProperty(ArgClassificationName(classPair.first));
@@ -586,21 +654,33 @@ void GuardDescriptorCollector::dumpStats(GenericPrinter& printer) {
   }
   jsonPrinter.endObject();
 
+  jsonPrinter.beginObjectProperty("missingCodecs");
+  for (auto& opPair : missingCodecOps) {
+    jsonPrinter.beginListProperty(CacheIRCodeName(opPair.first));
+    for (auto& arg : opPair.second) {
+      jsonPrinter.value("%s", ArgKindName(arg));
+    }
+    jsonPrinter.endList();
+  }
+  jsonPrinter.endObject();
+
+  jsonPrinter.endObject();
+
+  jsonPrinter.beginObjectProperty("counts");
+  jsonPrinter.property("arg", totalArgCounter);
+  jsonPrinter.property("op", totalOpCounter);
+  jsonPrinter.property("stub", totalStubCounter);
+  jsonPrinter.property("missingCodec", missingCodecCounter);
   jsonPrinter.endObject();
 
   jsonPrinter.beginObjectProperty("serializationStats");
 
-  jsonPrinter.beginObjectProperty("sums");
-  jsonPrinter.property("totalArg", totalSeenArgCounter);
-  jsonPrinter.property("serializedArg", serializedArgCounter);
-  jsonPrinter.property("totalOp", totalSeenOpCounter);
-  jsonPrinter.property("serializedOp", serializedOpCounter);
-  jsonPrinter.property("totalStub", totalSeenStubCounter);
-  jsonPrinter.property("serializedStub", serializedStubCounter);
-  jsonPrinter.endObject();
-
+  jsonPrinter.property("successfulCodec", successfulCodecCounter);
+  jsonPrinter.property("failedCodec", failedCodecCounter);
+  jsonPrinter.property("completeOp", completeOpCounter);
+  jsonPrinter.property("completeStub", completeStubCounter);
   jsonPrinter.beginObjectProperty("failures");
-  for (auto& opPair : failedOpCounters) {
+  for (auto& opPair : failedCodecOpCounters) {
     jsonPrinter.beginObjectProperty(CacheIRCodeName(opPair.first));
     for (auto& argPair : opPair.second) {
       jsonPrinter.property(ArgKindName(argPair.first), argPair.second);

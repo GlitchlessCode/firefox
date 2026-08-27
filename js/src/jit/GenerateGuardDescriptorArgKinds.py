@@ -163,7 +163,8 @@ def generate_guard_descriptor_arg_kinds_header(c_out, yaml_path):
 
         kinds = list(args.values()) if args else []
         has_unserializable = any(
-            guard_descriptor_arg_kind_classification(kind) == "Unserializable"
+            guard_descriptor_arg_kind_classification(
+                kind) == Classification.Unserializable
             for kind in kinds
         )
 
