@@ -204,6 +204,9 @@ class GuardDescriptorOpReader;
 // A CacheIRCodec represents a pairing of a serialization and
 // deserialization function for a single arg kind, but contains
 // no actual data or instance methods.
+//
+// NOTE: A new system may needed to allow dynamically sized values
+// as currently only statically sized serialized values are supported
 template <typename C>
 concept CacheIRCodec =
     requires(C::Source src, C::Dest dst, CacheIRReadData& readData,
@@ -408,7 +411,11 @@ ID_CODEC(ValueTagOperandId, ValueTagId, valueTagOperandId)
 
 // TODO: Finish serialization for Shape
 struct ShapeCodec {
-  struct SerializedShape {};
+  struct SerializedShape {
+    WellKnownClass cls;
+    WellKnownPrototype proto;
+    // TODO: Add all other values to be serialized
+  };
 
   using Source = Shape*;
   using Dest = SerializedShape;
@@ -423,8 +430,18 @@ struct ShapeCodec {
     SharedShape& shared = val->asShared();
     SharedPropMap* propMap = shared.propMap();
     TaggedProto proto = shared.proto();
-    // writer.writeRaw(read.readerMethod().id());
-    return mozilla::Nothing();
+
+    // TODO: Check prototype to see if it is well-known
+    // TODO: Check prototype with fuse to see if its been modified
+    // since a modified well-known prototype must be considered
+    // different, and thus, unserializable
+
+    SerializedShape serialized = {
+        WellKnownClass::PlainObject,  // This should be found, not constant
+        WellKnownPrototype::Object    // This should be found, not constant
+    };
+
+    return mozilla::Some(serialized);
   }
 
   static Source Deserialize(Dest dst, CacheIRWriteData& writeData) {
