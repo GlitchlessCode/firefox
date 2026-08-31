@@ -205,37 +205,42 @@ class GuardDescriptorOpReader;
 // deserialization function for a single arg kind, but contains
 // no actual data or instance methods.
 template <typename C>
-concept CacheIRCodec = requires(
-    C::Source val, CacheIRReadData& readData, CacheIRWriteData& writeData,
-    GuardDescriptorOpWriter& gWriter, GuardDescriptorOpReader& gReader) {
-  // The source data type of this codec
-  typename C::Source;
+concept CacheIRCodec =
+    requires(C::Source src, C::Dest dst, CacheIRReadData& readData,
+             CacheIRWriteData& writeData) {
+      // The source data type of this codec
+      typename C::Source;
+      // The serialized destination type of this codec. This must be trivially
+      // copyable.
+      typename C::Dest;
+      requires std::is_trivially_copyable_v<typename C::Dest>;
 
-  // Reads from readData to write a value to gWriter, returning
-  // true if the value was successfully serialized, and false
-  // if it failed.
+      // Takes the read value and tries to convert it to a serializable form.
+      // Returns Some(Dest) if it successfully serializes the value, which will
+      // be written out. Returns Nothing() if it fails to serialize the value,
+      // causing a serialization failure.
+      { C::Serialize(src) } -> std::same_as<mozilla::Maybe<typename C::Dest>>;
+
+      // Reads the serialized data from gReader and reconstructs it
+      // using writeData, returning Some(data) if it was successfully
+      // deserialized, and Nothing() otherwise.
+      //
+      // Takes an automatically read set of bytes in the form of Dest and must
+      // convert it back to Source. Also recieves writeData to help re-create
+      // the value. This operation should be infallible.
+      { C::Deserialize(dst, writeData) } -> std::same_as<typename C::Source>;
+    };
+
+template <typename C>
+concept CacheIRCodecExt = requires(CacheIRReadData& readData) {
+  requires CacheIRCodec<C>;
+
+  // Reads from readData to produce some source value, returning it.
+  // Performs no serialization, only extracts the value.
   //
   // SAFETY: This function MUST consume the appropriate quantity
   // of data from the CacheIRReader, as this is a side-effect
   // that is propagated forwards.
-  { C::Serialize(val, readData, gWriter) } -> std::same_as<bool>;
-
-  // Reads the serialized data from gReader and reconstructs it
-  // using writeData, returning Some(data) if it was successfully
-  // deserialized, and Nothing() otherwise.
-  //
-  // SAFETY: This function MUST consume the appropriate quantity
-  // of data from the GuardDescriptorOpReader, as this is a
-  // side-effect that is propagated forwards.
-  {
-    C::Deserialize(writeData, gReader)
-  } -> std::same_as<mozilla::Maybe<typename C::Source>>;
-};
-
-template <typename C>
-concept CacheIRCodecExt = requires(CacheIRReadData& readData) {
-  CacheIRCodec<C>;
-
   { C::Read(readData) } -> std::same_as<typename C::Source>;
 };
 
@@ -270,16 +275,10 @@ class GuardDescriptorOpWriter {
     requires CacheIRCodecExt<Codec>
   {
     if (!failed_) {
-      failed_ = !Codec::Serialize(Codec::Read(readData), readData, *this);
-    }
-  }
-
-  template <typename Codec>
-  void writeSection(Codec::Source val, CacheIRReadData& readData)
-    requires CacheIRCodec<Codec>
-  {
-    if (!failed_) {
-      failed_ = !Codec::Serialize(val, readData, *this);
+      mozilla::Maybe<typename Codec::Dest> val =
+          Codec::Serialize(Codec::Read(readData));
+      failed_ = val.isNothing();
+      val.apply([&](typename Codec::Dest dst) { writeRaw(dst); });
     }
   }
 
@@ -297,37 +296,6 @@ class GuardDescriptorOpReader {
   explicit GuardDescriptorOpReader(mozilla::Span<const uint8_t> bytes)
       : bytes(bytes) {}
 
-  mozilla::Maybe<uint8_t> readUint8() {
-    if (pos_ + 1 > bytes.Length()) {
-      return mozilla::Nothing();
-    }
-    return mozilla::Some(bytes[pos_++]);
-  }
-  mozilla::Maybe<uint16_t> readUint16() {
-    mozilla::Maybe<uint8_t> lo = readUint8();
-    mozilla::Maybe<uint8_t> hi = readUint8();
-    if (!lo || !hi) {
-      return mozilla::Nothing();
-    }
-    return mozilla::Some(uint16_t(uint16_t(*lo) | (uint16_t(*hi) << 8)));
-  }
-  mozilla::Maybe<uint32_t> readUint32() {
-    mozilla::Maybe<uint16_t> lo = readUint16();
-    mozilla::Maybe<uint16_t> hi = readUint16();
-    if (!lo || !hi) {
-      return mozilla::Nothing();
-    }
-    return mozilla::Some(uint32_t(*lo) | (uint32_t(*hi) << 16));
-  }
-  mozilla::Maybe<uint64_t> readUint64() {
-    mozilla::Maybe<uint32_t> lo = readUint32();
-    mozilla::Maybe<uint32_t> hi = readUint32();
-    if (!lo || !hi) {
-      return mozilla::Nothing();
-    }
-    return mozilla::Some(uint64_t(*lo) | (uint64_t(*hi) << 32));
-  }
-
   template <typename T>
   mozilla::Maybe<T> readRaw() {
     static_assert(std::is_trivially_copyable_v<T>);
@@ -343,10 +311,13 @@ class GuardDescriptorOpReader {
   }
 
   template <typename Codec>
-  mozilla::Maybe<typename Codec::Source> read()
+  mozilla::Maybe<typename Codec::Source> readArg(CacheIRWriteData& writeData)
     requires CacheIRCodec<Codec>
   {
-    return Codec::Deserialize(*this);
+    mozilla::Maybe<typename Codec::Dest> val = readRaw<typename Codec::Dest>();
+    return val.andThen([&](typename Codec::Dest dst) {
+      return Codec::Deserialize(dst, writeData);
+    });
   }
 };
 
@@ -369,24 +340,22 @@ class GuardDescriptorStubWriter {
 
 // Most immediates can just be written out as raw binary data, and then be
 // read back, casted as the correct type.
-#  define IMM_CODEC(ty, name, readerMethod)                               \
-    struct name##Codec {                                                  \
-      using Source = ty;                                                  \
-                                                                          \
-      static Source Read(CacheIRReadData& readData) {                     \
-        return readData.reader.readerMethod();                            \
-      }                                                                   \
-                                                                          \
-      static bool Serialize(Source val, CacheIRReadData& readData,        \
-                            GuardDescriptorOpWriter& writer) {            \
-        writer.writeRaw(val);                                             \
-        return true;                                                      \
-      }                                                                   \
-                                                                          \
-      static mozilla::Maybe<Source> Deserialize(                          \
-          CacheIRWriteData& writeData, GuardDescriptorOpReader& reader) { \
-        return reader.readRaw<Source>();                                  \
-      }                                                                   \
+#  define IMM_CODEC(ty, name, readerMethod)                              \
+    struct name##Codec {                                                 \
+      using Source = ty;                                                 \
+      using Dest = ty;                                                   \
+                                                                         \
+      static Source Read(CacheIRReadData& readData) {                    \
+        return readData.reader.readerMethod();                           \
+      }                                                                  \
+                                                                         \
+      static mozilla::Maybe<Dest> Serialize(Source src) {                \
+        return mozilla::Some(src);                                       \
+      }                                                                  \
+                                                                         \
+      static Source Deserialize(Dest dst, CacheIRWriteData& writeData) { \
+        return dst;                                                      \
+      }                                                                  \
     };
 
 IMM_CODEC(bool, BoolImm, readBool)
@@ -407,25 +376,22 @@ IMM_CODEC(GuardClassKind, GuardClassKindImm, guardClassKind)
 // Most IDs can be serialized directly by writing out their value, and then
 // just reading them back in. The CacheIRWriter will need to be informed of
 // the IDs being used, but for the most part, IDs are a trivial operation.
-#  define ID_CODEC(ty, name, readerMethod)                                \
-    struct name##Codec {                                                  \
-      using Source = ty;                                                  \
-                                                                          \
-      static Source Read(CacheIRReadData& readData) {                     \
-        return readData.reader.readerMethod();                            \
-      }                                                                   \
-                                                                          \
-      static bool Serialize(Source val, CacheIRReadData& readData,        \
-                            GuardDescriptorOpWriter& writer) {            \
-        writer.writeRaw(val.id());                                        \
-        return true;                                                      \
-      }                                                                   \
-                                                                          \
-      static mozilla::Maybe<Source> Deserialize(                          \
-          CacheIRWriteData& writeData, GuardDescriptorOpReader& reader) { \
-        return reader.readRaw<uint16_t>().map(                            \
-            [](uint16_t id) { return ty(id); });                          \
-      }                                                                   \
+#  define ID_CODEC(ty, name, readerMethod)                               \
+    struct name##Codec {                                                 \
+      using Source = ty;                                                 \
+      using Dest = uint16_t;                                             \
+                                                                         \
+      static Source Read(CacheIRReadData& readData) {                    \
+        return readData.reader.readerMethod();                           \
+      }                                                                  \
+                                                                         \
+      static mozilla::Maybe<Dest> Serialize(Source src) {                \
+        return mozilla::Some(src.id());                                  \
+      }                                                                  \
+                                                                         \
+      static Source Deserialize(Dest dst, CacheIRWriteData& writeData) { \
+        return ty(dst);                                                  \
+      }                                                                  \
     };
 
 // TODO: Implement id setting on deserialization
@@ -440,37 +406,28 @@ ID_CODEC(StringOperandId, StringId, stringOperandId)
 ID_CODEC(SymbolOperandId, SymbolId, symbolOperandId)
 ID_CODEC(ValueTagOperandId, ValueTagId, valueTagOperandId)
 
-struct WeakShapeFieldCodec {
-  using Source = Shape*;
-
+// TODO: Finish serialization for Shape
+struct ShapeCodec {
   struct SerializedShape {};
 
-  struct SerializedPropMap {};
+  using Source = Shape*;
+  using Dest = SerializedShape;
 
-  static Source Read(CacheIRReadData& readData) {
-    uint32_t stubOffset = readData.reader.stubOffset();
-    auto weakShape = readData.info->getStubField<StubField::Type::WeakShape>(
-        readData.stub, stubOffset);
-    // TODO: Determine if weak shape can disappear before we use it
-    Shape* shape = weakShape.get();
-    return shape;
-  }
+  // TODO: Needs all the properties of a serialized shape;
 
-  static bool Serialize(Source val, CacheIRReadData& readData,
-                        GuardDescriptorOpWriter& writer) {
+  static mozilla::Maybe<Dest> Serialize(Source val) {
     // TODO: Handle cases that are not SharedShape, this is a prototype
     if (!val->isShared()) {
-      return false;
+      return mozilla::Nothing();
     }
     SharedShape& shared = val->asShared();
     SharedPropMap* propMap = shared.propMap();
     TaggedProto proto = shared.proto();
     // writer.writeRaw(read.readerMethod().id());
-    return true;
+    return mozilla::Nothing();
   }
 
-  static mozilla::Maybe<Source> Deserialize(CacheIRWriteData& writeData,
-                                            GuardDescriptorOpReader& reader) {
+  static Source Deserialize(Dest dst, CacheIRWriteData& writeData) {
     JS::Rooted<SharedPropMap*> map(writeData.context);
     JSClass a;
     ObjectFlags b;
@@ -487,17 +444,29 @@ struct WeakShapeFieldCodec {
     // SharedShape::getPropMapShape(JSContext *cx, BaseShape *base,
     // size_t nfixed, Handle<SharedPropMap *> map, uint32_t mapLength,
     // ObjectFlags objectFlags)
-    return mozilla::Nothing();
   }
 };
 
-struct SharedPropMapCodec {
-  using Source = SharedPropMap*;
+// Inherit from ShapeCodec as shared code, only unique part is the ShapeCodecExt
+// static Read method
+struct ShapeFieldCodec : ShapeCodec {
+  static Source Read(CacheIRReadData& readData) {
+    uint32_t stubOffset = readData.reader.stubOffset();
+    auto shape = readData.info->getStubField<StubField::Type::Shape>(
+        readData.stub, stubOffset);
+    return shape;
+  }
+};
 
-  static bool Serialize(Source val, CacheIRReadData& readData,
-                        GuardDescriptorOpWriter& writer) {}
-  static mozilla::Maybe<Source> Deserialize(CacheIRWriteData& writeData,
-                                            GuardDescriptorOpReader& reader) {}
+struct WeakShapeFieldCodec : ShapeCodec {
+  static Source Read(CacheIRReadData& readData) {
+    uint32_t stubOffset = readData.reader.stubOffset();
+    auto weakShape = readData.info->getStubField<StubField::Type::WeakShape>(
+        readData.stub, stubOffset);
+    // TODO: Determine if weak shape can disappear before we use it
+    Shape* shape = weakShape.get();
+    return shape;
+  }
 };
 
 /*
